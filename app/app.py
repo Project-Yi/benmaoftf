@@ -134,6 +134,8 @@ class CopilotApp(QObject):
         self._answer_defer_start: Optional[float] = None
         self._answering = False
         self._pending_answer = False
+        self._vision_running = False
+        self._last_vision_completed_at = 0.0
         # 模型把这句话判成“等待问题”时，是否已经用过一次“按大意重答”的宽容重试
         self._answer_retried = False
         self._listening = False
@@ -149,6 +151,8 @@ class CopilotApp(QObject):
         self._phone_active = False
         self._pending_shots: List[bytes] = []
         self.region_selector: Optional[RegionSelector] = None
+        self._capture_schedule_mode = "off"
+        self._capture_schedule_seconds = 10
         # 本次会话的题目（不含回答），随时可以保存成 markdown
         self.notes = NoteBook()
         self._current_focus = ""
@@ -165,12 +169,22 @@ class CopilotApp(QObject):
         self.remote.auto_requested.connect(self._on_remote_auto, Qt.QueuedConnection)
         self.remote.shot_add_requested.connect(self.add_remote_shot, Qt.QueuedConnection)
         self.remote.shot_submit_requested.connect(self.submit_remote_shots, Qt.QueuedConnection)
+        self.remote.capture_schedule_requested.connect(
+            self.configure_capture_schedule, Qt.QueuedConnection
+        )
         self.remote.clear_requested.connect(self.clear_remote, Qt.QueuedConnection)
         self.remote.phone_connected.connect(self._on_phone_connected, Qt.QueuedConnection)
 
         self._answer_timer = QTimer(self)
         self._answer_timer.setSingleShot(True)
         self._answer_timer.timeout.connect(self.request_answer)
+
+        self._after_answer_capture_timer = QTimer(self)
+        self._after_answer_capture_timer.setSingleShot(True)
+        self._after_answer_capture_timer.timeout.connect(self._run_scheduled_capture)
+
+        self._interval_capture_timer = QTimer(self)
+        self._interval_capture_timer.timeout.connect(self._run_scheduled_capture)
 
         self._connect_panel()
         self._build_tray()
@@ -372,6 +386,7 @@ class CopilotApp(QObject):
         self.remote_dialog.raise_()
 
     def stop_remote(self) -> None:
+        self._stop_capture_schedule()
         self.remote.stop()
         self._phone_active = False
         self._pending_shots.clear()
@@ -411,6 +426,113 @@ class CopilotApp(QObject):
         self._pending_shots.clear()
         self.remote_state.clear()
         self.set_status("已清空手机端记录")
+
+    def configure_capture_schedule(self, mode: str, seconds: int) -> None:
+        """手机端设置定时识题；计时器放在电脑端，页面后台运行也不受影响。"""
+        self._after_answer_capture_timer.stop()
+        self._interval_capture_timer.stop()
+        self._capture_schedule_seconds = max(1, min(3600, int(seconds)))
+
+        if mode not in ("after_answer", "interval"):
+            self._capture_schedule_mode = "off"
+            self.remote_state.set_capture_schedule(
+                "off", self._capture_schedule_seconds, phase="idle"
+            )
+            self.set_status("定时识题已关闭")
+            return
+
+        self._capture_schedule_mode = mode
+        if mode == "interval":
+            self._interval_capture_timer.start(self._capture_schedule_seconds * 1000)
+            self.remote_state.set_capture_schedule(
+                "interval",
+                self._capture_schedule_seconds,
+                next_in=self._capture_schedule_seconds,
+                phase="scheduled",
+            )
+            self.set_status(f"定时识题已开启：每 {self._capture_schedule_seconds} 秒识题一次")
+            return
+
+        if self._vision_running:
+            self.remote_state.set_capture_schedule(
+                "after_answer",
+                self._capture_schedule_seconds,
+                phase="waiting_answer",
+            )
+            self.set_status("定时识题已开启：等待本次 AI 答案")
+        elif self._last_vision_completed_at > 0:
+            self._arm_after_answer_capture()
+            self.set_status(
+                f"定时识题已开启：答案完成后延迟 {self._capture_schedule_seconds} 秒"
+            )
+        else:
+            self.remote_state.set_capture_schedule(
+                "after_answer",
+                self._capture_schedule_seconds,
+                phase="waiting_answer",
+            )
+            self.set_status("定时识题已开启：先截图识题，答案后会继续")
+
+    def _stop_capture_schedule(self) -> None:
+        self._after_answer_capture_timer.stop()
+        self._interval_capture_timer.stop()
+        self._capture_schedule_mode = "off"
+        self.remote_state.set_capture_schedule(
+            "off", self._capture_schedule_seconds, phase="idle"
+        )
+
+    def _arm_after_answer_capture(self) -> None:
+        if self._capture_schedule_mode != "after_answer" or not self._phone_active:
+            return
+        self._after_answer_capture_timer.start(self._capture_schedule_seconds * 1000)
+        self.remote_state.set_capture_schedule(
+            "after_answer",
+            self._capture_schedule_seconds,
+            next_in=self._capture_schedule_seconds,
+            phase="scheduled",
+        )
+
+    def _run_scheduled_capture(self) -> None:
+        if self._capture_schedule_mode == "off" or not self._phone_active:
+            return
+
+        if self._capture_schedule_mode == "interval":
+            self.remote_state.set_capture_schedule(
+                "interval",
+                self._capture_schedule_seconds,
+                next_in=self._capture_schedule_seconds,
+                phase="scheduled",
+            )
+
+        if self._vision_running or (
+            self.shot_worker is not None and self.shot_worker.isRunning()
+        ):
+            if self._capture_schedule_mode == "after_answer":
+                self.remote_state.set_capture_schedule(
+                    "after_answer",
+                    self._capture_schedule_seconds,
+                    phase="waiting_answer",
+                )
+            self.set_status("识题仍在进行，本次定时截图已跳过")
+            return
+
+        if self._vision_client() is None:
+            if self._capture_schedule_mode == "after_answer":
+                self.remote_state.set_capture_schedule(
+                    "after_answer",
+                    self._capture_schedule_seconds,
+                    phase="error",
+                )
+            self.set_status("未配置视觉模型，定时识题无法执行")
+            return
+
+        if self._capture_schedule_mode == "after_answer":
+            self.remote_state.set_capture_schedule(
+                "after_answer",
+                self._capture_schedule_seconds,
+                phase="capturing",
+            )
+        self.screenshot_answer()
 
     def save_notes(self) -> None:
         """把本次会话的题目存成 markdown（只存题目，不存回答）。"""
@@ -1027,12 +1149,28 @@ class CopilotApp(QObject):
             if not self._phone_active:
                 self.panel.tabs.setCurrentIndex(1)
             self.set_status("未配置视觉模型")
+            if self._capture_schedule_mode == "after_answer":
+                self._after_answer_capture_timer.stop()
+                self.remote_state.set_capture_schedule(
+                    "after_answer",
+                    self._capture_schedule_seconds,
+                    phase="error",
+                )
             return
 
         if self.shot_worker is not None and self.shot_worker.isRunning():
             return
         if self.region_selector is not None:
             return
+
+        if self._capture_schedule_mode == "after_answer":
+            # 手动截图优先：取消正在等待的答后自动截图，等这次答案完成后再重新计时。
+            self._after_answer_capture_timer.stop()
+            self.remote_state.set_capture_schedule(
+                "after_answer",
+                self._capture_schedule_seconds,
+                phase="capturing",
+            )
 
         # 单张截图会丢弃之前累计的多图。
         self._pending_shots.clear()
@@ -1117,6 +1255,12 @@ class CopilotApp(QObject):
             self.overlay.begin("截图失败")
             self.overlay.error(message)
         self.set_status(f"截图失败：{message}")
+        if self._capture_schedule_mode == "after_answer":
+            self.remote_state.set_capture_schedule(
+                "after_answer",
+                self._capture_schedule_seconds,
+                phase="error",
+            )
 
     def add_remote_shot(self) -> None:
         """手机端“追加截图”：只截图并累计，不立即识题。"""
@@ -1158,6 +1302,12 @@ class CopilotApp(QObject):
             if not self._phone_active:
                 self.panel.tabs.setCurrentIndex(1)
             self.set_status("未配置视觉模型")
+            if self._capture_schedule_mode == "after_answer":
+                self.remote_state.set_capture_schedule(
+                    "after_answer",
+                    self._capture_schedule_seconds,
+                    phase="error",
+                )
             return
 
         if self.vision_worker is None:
@@ -1184,19 +1334,37 @@ class CopilotApp(QObject):
         self._overlay_begin("正在识题…")
         self.notes.add_exam(images)
         self.remote_state.begin_answer("exam")
+        self._vision_running = True
+        if self._capture_schedule_mode != "off":
+            self.remote_state.set_capture_schedule(
+                self._capture_schedule_mode,
+                self._capture_schedule_seconds,
+                phase="capturing",
+            )
         self.set_status("正在识题…")
         self.vision_worker.submit(images)
 
     def on_vision_completed(self) -> None:
+        self._vision_running = False
+        self._last_vision_completed_at = time.monotonic()
         self.remote_state.end_answer()
         if not self._phone_active:
             self.overlay.finish()
         self.set_status("答题完成")
+        if self._capture_schedule_mode == "after_answer":
+            self._arm_after_answer_capture()
 
     def on_vision_failed(self, message: str) -> None:
+        self._vision_running = False
         self.remote_state.end_answer(message)
         self._overlay_error(message)
         self.set_status(f"识题失败：{message}")
+        if self._capture_schedule_mode == "after_answer":
+            self.remote_state.set_capture_schedule(
+                "after_answer",
+                self._capture_schedule_seconds,
+                phase="error",
+            )
 
     def apply_config(self, config: Dict[str, Any]) -> None:
         old = self.config
@@ -1243,6 +1411,7 @@ class CopilotApp(QObject):
 
     def shutdown(self) -> None:
         self.stop_listening()
+        self._stop_capture_schedule()
         self.remote.stop()
         self._close_region_selector()
         for worker in (self.answer_worker, self.vision_worker):

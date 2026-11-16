@@ -4,6 +4,7 @@ import json
 import secrets
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -45,6 +46,11 @@ class RemoteState:
         self._answer_id = 0
         # 识别中 / 等答案时先给用户一句可以开口的垫话
         self._hint = ""
+        # 手机端定时识题：off / after_answer / interval
+        self._schedule_mode = "off"
+        self._schedule_seconds = 10
+        self._schedule_next_at = 0.0
+        self._schedule_phase = "idle"
 
     def set_status(self, text: str) -> None:
         with self._lock:
@@ -77,6 +83,23 @@ class RemoteState:
     def clear_hint(self) -> None:
         with self._lock:
             self._hint = ""
+
+    def set_capture_schedule(
+        self,
+        mode: str,
+        seconds: int,
+        next_in: int = 0,
+        phase: str = "idle",
+    ) -> None:
+        with self._lock:
+            self._schedule_mode = mode if mode in ("after_answer", "interval") else "off"
+            self._schedule_seconds = max(1, min(3600, int(seconds)))
+            self._schedule_next_at = (
+                time.time() + max(0, int(next_in))
+                if self._schedule_mode != "off" and next_in > 0
+                else 0.0
+            )
+            self._schedule_phase = phase
 
     def begin_answer(self, kind: str, question: str = "") -> None:
         with self._lock:
@@ -127,6 +150,9 @@ class RemoteState:
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
+            next_in = 0
+            if self._schedule_next_at > 0:
+                next_in = max(0, int(self._schedule_next_at - time.time() + 0.999))
             return {
                 "status": self._status,
                 "listening": self._listening,
@@ -135,6 +161,12 @@ class RemoteState:
                 "transcript": self._transcript,
                 "answers": [dict(item) for item in self._answers],
                 "hint": self._hint,
+                "schedule": {
+                    "mode": self._schedule_mode,
+                    "seconds": self._schedule_seconds,
+                    "next_in": next_in,
+                    "phase": self._schedule_phase,
+                },
             }
 
 
@@ -147,6 +179,7 @@ class RemoteServer(QObject):
     auto_requested = Signal(bool)
     shot_add_requested = Signal()
     shot_submit_requested = Signal()
+    capture_schedule_requested = Signal(str, int)
     clear_requested = Signal()
     phone_connected = Signal()
 
@@ -257,6 +290,19 @@ class RemoteServer(QObject):
                     server.shot_add_requested.emit()
                 elif parsed.path == "/api/shot/submit":
                     server.shot_submit_requested.emit()
+                elif parsed.path == "/api/capture-schedule":
+                    try:
+                        data = json.loads(raw or b"{}")
+                        mode = str(data.get("mode") or "off")
+                        seconds = int(data.get("seconds") or 10)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        self._send(400, b"invalid schedule", "text/plain; charset=utf-8")
+                        return
+                    if mode not in ("off", "after_answer", "interval"):
+                        self._send(400, b"invalid schedule mode", "text/plain; charset=utf-8")
+                        return
+                    seconds = max(1, min(3600, seconds))
+                    server.capture_schedule_requested.emit(mode, seconds)
                 elif parsed.path == "/api/clear":
                     server.clear_requested.emit()
                 else:

@@ -30,6 +30,23 @@
   .bar .spacer { margin-left: auto; }
   .bar .ghost { background: transparent; border: 1px solid #313a4f; color: #9aa3b8;
     font-size: 12px; padding: 5px 10px; border-radius: 8px; }
+  .timerbar { flex: 0 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center; gap: 6px; padding: 7px 12px; background: #10131a;
+    border-bottom: 1px solid #1f242f; }
+  .timerbar .field { display: flex; align-items: center; gap: 6px; min-width: 0;
+    color: #cfd6e6; font-size: 12px; }
+  .timerbar select, .timerbar input { height: 30px; border: 1px solid #313a4f;
+    border-radius: 7px; background: #181d27; color: #e8eaf0; font-size: 12px; outline: none; }
+  .timerbar select { min-width: 0; width: 108px; padding: 0 6px; }
+  .timerbar input { width: 52px; padding: 0 5px; text-align: center; }
+  .timerbar button { height: 30px; padding: 0 11px; border-radius: 7px;
+    border: 1px solid #3b6ef6; background: #315fda; color: #fff; font-size: 12px; font-weight: 600; }
+  .timerbar button:disabled { opacity: .55; }
+  .timerbar select:disabled, .timerbar input:disabled { opacity: .65; }
+  #scheduleState { grid-column: 1 / -1; min-height: 14px; text-align: right;
+    color: #7f8ba6; font-size: 11px; line-height: 14px; }
+  #scheduleState.active { color: #76a2ff; }
+  #scheduleState.error { color: #f87171; }
   main { flex: 1 1 auto; overflow-y: auto; padding: 10px 12px 14px; -webkit-overflow-scrolling: touch; }
   details { background: #151922; border: 1px solid #232836; border-radius: 10px;
     padding: 8px 10px; margin-bottom: 10px; }
@@ -89,6 +106,21 @@
   <span class="spacer"></span>
   <button id="clearBtn" class="ghost">清空</button>
 </div>
+<div class="timerbar">
+  <label class="field" for="scheduleMode">
+    <span>定时识题</span>
+    <select id="scheduleMode">
+      <option value="after_answer">答后延迟</option>
+      <option value="interval">固定间隔</option>
+    </select>
+  </label>
+  <label class="field" for="scheduleSeconds">
+    <input type="number" id="scheduleSeconds" min="1" max="3600" step="1" value="10" inputmode="numeric">
+    <span>秒</span>
+  </label>
+  <button id="scheduleBtn">开启</button>
+  <span id="scheduleState">未开启</span>
+</div>
 <main id="main">
   <details open>
     <summary>实时转写</summary>
@@ -117,6 +149,9 @@
   var toastTimer = null;
   // 刚拨动开关时短暂锁定，避免轮询用旧状态把开关拨回去（700ms 一轮，留两轮余量）
   var autoLockUntil = 0;
+  var scheduleLockUntil = 0;
+  var scheduleView = { mode: 'off', seconds: 10, nextIn: 0, phase: 'idle' };
+  var scheduleReceivedAt = 0;
 
   function api(path, options) {
     var sep = path.indexOf('?') >= 0 ? '&' : '?';
@@ -196,6 +231,57 @@
     return { letter: m[1].toUpperCase(), option: m[2].trim() };
   }
 
+  function updateScheduleState() {
+    var label = document.getElementById('scheduleState');
+    var view = scheduleView;
+    label.className = '';
+    if (view.mode === 'off') {
+      label.textContent = '未开启';
+      return;
+    }
+
+    label.className = view.phase === 'error' ? 'error' : 'active';
+    var elapsed = Math.floor((Date.now() - scheduleReceivedAt) / 1000);
+    var remaining = Math.max(0, view.nextIn - elapsed);
+    if (view.mode === 'after_answer') {
+      if (view.phase === 'error') {
+        label.textContent = '识题失败，手动截图后继续';
+      } else if (remaining > 0) {
+        label.textContent = '答案后 ' + remaining + ' 秒截图';
+      } else if (view.phase === 'capturing') {
+        label.textContent = '正在自动识题';
+      } else {
+        label.textContent = '等待 AI 答案完成';
+      }
+      return;
+    }
+
+    label.textContent = remaining > 0
+      ? '下次自动识题：' + remaining + ' 秒'
+      : '正在准备自动识题';
+  }
+
+  function renderScheduleControl(state) {
+    var schedule = state.schedule || {};
+    scheduleView = {
+      mode: schedule.mode || 'off',
+      seconds: Math.max(1, Math.min(3600, Number(schedule.seconds) || 10)),
+      nextIn: Math.max(0, Number(schedule.next_in) || 0),
+      phase: schedule.phase || 'idle'
+    };
+    scheduleReceivedAt = Date.now();
+
+    var active = scheduleView.mode !== 'off';
+    if (active && Date.now() > scheduleLockUntil) {
+      document.getElementById('scheduleMode').value = scheduleView.mode;
+      document.getElementById('scheduleSeconds').value = scheduleView.seconds;
+    }
+    document.getElementById('scheduleMode').disabled = active;
+    document.getElementById('scheduleSeconds').disabled = active;
+    document.getElementById('scheduleBtn').textContent = active ? '关闭' : '开启';
+    updateScheduleState();
+  }
+
   function render(state) {
     document.getElementById('statusText').textContent = state.status || '待命';
     document.getElementById('listenBtn').textContent = state.listening ? '停止监听' : '开始监听';
@@ -207,6 +293,7 @@
     var submitBtn = document.getElementById('submitShotsBtn');
     submitBtn.textContent = '提交（' + shots + '）';
     submitBtn.disabled = shots === 0;
+    renderScheduleControl(state);
 
     var transcript = document.getElementById('transcript');
     transcript.textContent = state.transcript || '（尚未开始监听）';
@@ -215,7 +302,10 @@
     var sig = answers.map(function (a) {
       return a.id + ':' + a.text.length + ':' + (a.done ? 1 : 0) + ':' + a.error + ':' + (a.q || '').length;
     }).join('|');
-    sig += '|' + shots + '|' + (state.auto ? 1 : 0) + '|' + (state.hint || '');
+    var schedule = state.schedule || {};
+    sig += '|' + shots + '|' + (state.auto ? 1 : 0) + '|' + (state.hint || '')
+      + '|' + (schedule.mode || 'off') + ':' + (schedule.seconds || 10)
+      + ':' + (schedule.phase || 'idle');
     if (sig === lastSig) return;
     lastSig = sig;
 
@@ -364,8 +454,30 @@
     } catch (e) { toast('操作失败'); }
   });
 
+  document.getElementById('scheduleBtn').addEventListener('click', async function () {
+    var active = scheduleView.mode !== 'off';
+    var mode = document.getElementById('scheduleMode').value;
+    var seconds = Math.max(1, Math.min(3600,
+      parseInt(document.getElementById('scheduleSeconds').value, 10) || 10));
+    this.disabled = true;
+    scheduleLockUntil = Date.now() + 1500;
+    try {
+      await post('/api/capture-schedule', {
+        mode: active ? 'off' : mode,
+        seconds: seconds
+      });
+      toast(active ? '定时识题已关闭' : '定时识题已开启');
+      await poll();
+      this.disabled = false;
+    } catch (e) {
+      toast('操作失败');
+      this.disabled = false;
+    }
+  });
+
   poll();
   setInterval(poll, 700);
+  setInterval(updateScheduleState, 250);
   document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
 </script>
 </body>
